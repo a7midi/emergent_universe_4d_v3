@@ -1,0 +1,60 @@
+# Simulation Parameters
+simulation:
+  total_ticks: 12000
+  seed: 42              # Single seed for full-run reproducibility
+  hide_layer_index: 0
+  log_interval: 100
+  verbose: false
+
+# Output
+output:
+  gzip: true           # true => write simulation_log.jsonl.gz
+  schema: "v1"
+
+# Causal Site (Graph) Parameters
+causal_site:
+  layers: 140
+  avg_nodes_per_layer: 36
+  edge_probability: 0.15
+  max_lookback_layers: 4
+
+# State & Tag Parameters
+tags:
+  alphabet_size_q: 13
+  max_out_degree_R: 4
+  fusion_mode: "injective"  # 'injective' | 'quadratic' | 'sum_mod_q'
+
+# Particle Detection Parameters
+detector:
+  grid_size: 32
+  max_history_length: 12000
+  min_loop_period: 3
+  min_particle_size: 3
+  memory_window: 4096
+  match_jaccard_threshold: 0.5
+  min_overlap_size: 2  
+
+# Geometry Engine
+geometry:
+  chart_scale_k: 4     # L_k = 2^-k
+  gh_tolerance: 0.07
+
+# Experiments (optional; the log already has placeholders)
+experiments:
+  chsh:
+    enabled: false
+    pairs_per_measurement: 128
+    ball_radius: 2
+    a_offset: 0
+    a_prime_offset: 1
+    b_offset: 0
+    b_prime_offset: 1
+  rg:
+    enabled: false
+    k_values: [1, 2, 3, 4, 5]
+
+# Visualization Parameters (offline viewers use the HTML files)
+visualization:
+  enabled: false
+  update_interval: 10
+  save_frames: false

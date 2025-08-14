@@ -1,0 +1,18 @@
+# --- Core runtime dependencies ---
+networkx          # causal-site DAG & reachability
+numpy             # numerical arrays, vectorised ops
+pyyaml            # read/write config.yaml
+matplotlib        # static plots (geometry_report, etc.)
+tqdm              # progress bars for simulations
+scikit-learn      # MDS embedding, clustering
+scipy             # Procrustes alignment, math utils
+pygltflib         # optional: glTF export for build_scene.py
+jinja2            # optional: HTML reports
+
+# --- Optional / extended features ---
+pandas            # convenient log/dataframe analysis
+typing_extensions # backports of newer type hints for Python<3.9
+
+# --- If you add high-perf kernels later ---
+# numba            # optional: accelerate CHSH or RG analysis
+# joblib           # optional: parallelise embedding / experiments

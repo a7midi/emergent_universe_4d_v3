@@ -1,0 +1,338 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>Emergent-Universe Viewer</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <!-- silence favicon 404 -->
+  <link rel="icon" href="data:,">
+  <style>
+    html,body{margin:0;height:100%;overflow:hidden;background:#000;font-family:system-ui,Segoe UI,Roboto,sans-serif}
+    canvas#c{display:block}
+    #hud{position:fixed;bottom:10px;left:50%;transform:translateX(-50%);
+         display:flex;align-items:center;gap:10px;color:#eee;font-size:13px;
+         background:rgba(17,24,39,.55);backdrop-filter:blur(6px);padding:6px 10px;border-radius:7px}
+    #seek{width:360px}
+    button{cursor:pointer;padding:2px 10px;border:none;border-radius:4px;background:#1e40af;color:#fff}
+    label{display:flex;align-items:center;gap:4px;cursor:pointer}
+    #spark{width:140px;height:28px}
+    #drop{position:fixed;inset:0;background:rgba(2,6,23,.6);color:#cbd5e1;display:none;align-items:center;justify-content:center;font-size:22px}
+    #meta{display:flex;gap:10px;align-items:center}
+    #meta .pill{padding:2px 6px;border-radius:999px;background:rgba(148,163,184,.25);color:#e5e7eb;font-size:12px}
+  </style>
+
+  <!-- Import map so bare 'three' and 'three/addons/*' resolve -->
+  <script type="importmap">
+  {
+    "imports": {
+      "three": "https://cdn.jsdelivr.net/npm/three@0.163/build/three.module.js",
+      "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.163/examples/jsm/"
+    }
+  }
+  </script>
+</head>
+<body>
+  <canvas id="c"></canvas>
+
+  <div id="hud">
+    <button id="play">❚❚</button>
+    <input id="seek" type="range" min="0" value="0">
+    <span id="lbl">tick 0</span>
+    <span id="fps">– fps</span>
+    <canvas id="spark"></canvas>
+    <div id="meta">
+      <span id="live" class="pill">live 0</span>
+      <span id="born" class="pill">births 0</span>
+      <span id="dead" class="pill">deaths 0</span>
+      <span id="long" class="pill">longest 0</span>
+      <span id="md"   class="pill">mem —</span>
+      <span id="curv" class="pill">κ —</span>
+      <span id="chsh" class="pill">S —</span>
+    </div>
+    <label><input id="showLines" type="checkbox" checked> substrate</label>
+    <label><input id="showWL"   type="checkbox" checked> world-lines</label>
+    <button id="load">Open…</button>
+  </div>
+
+  <div id="drop">Drop <code>simulation_log.jsonl</code> or <code>.jsonl.gz</code></div>
+  <input id="picker" type="file" accept=".jsonl,.jsonl.gz" hidden>
+
+  <script type="module">
+  import * as THREE from 'three';
+  import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+
+  /* --------- declare early to avoid TDZ --------- */
+  let FR = [];                 // frames
+  let pidToSlot = new Map();   // id -> slot
+  let MAXP = 1;
+
+  /* --------- dom refs --------- */
+  const drop = document.getElementById('drop');
+  const picker = document.getElementById('picker');
+  const playBtn=document.getElementById('play');
+  const seek   =document.getElementById('seek');
+  const lbl    =document.getElementById('lbl');
+  const fpsLbl =document.getElementById('fps');
+  const showLines=document.getElementById('showLines');
+  const showWL  =document.getElementById('showWL');
+  const liveLbl =document.getElementById('live');
+  const bornLbl =document.getElementById('born');
+  const deadLbl =document.getElementById('dead');
+  const longLbl =document.getElementById('long');
+  const mdLbl   =document.getElementById('md');
+  const curvLbl =document.getElementById('curv');
+  const chshLbl =document.getElementById('chsh');
+  const spark   =document.getElementById('spark');
+  const sctx    =spark.getContext('2d');
+
+  /* --------- file helpers --------- */
+  document.getElementById('load').onclick = ()=> picker.click();
+  picker.onchange = e => { if(e.target.files[0]) loadFromFile(e.target.files[0]); };
+  ['dragenter','dragover'].forEach(ev=>{
+    window.addEventListener(ev, e=>{ e.preventDefault(); drop.style.display='flex'; }, false);
+  });
+  ['dragleave','drop'].forEach(ev=>{
+    window.addEventListener(ev, e=>{
+      e.preventDefault();
+      if(ev==='drop' && e.dataTransfer.files[0]) loadFromFile(e.dataTransfer.files[0]);
+      drop.style.display='none';
+    }, false);
+  });
+
+  async function readTextMaybeGz(fileOrPath){
+    try{
+      if(fileOrPath instanceof File){
+        if(fileOrPath.name.toLowerCase().endsWith('.gz')){
+          if(!('DecompressionStream' in window)) throw new Error('No gzip support');
+          const ds = new DecompressionStream('gzip');
+          const resp = new Response(fileOrPath.stream().pipeThrough(ds));
+          return await resp.text();
+        }
+        return await fileOrPath.text();
+      }else{
+        const res = await fetch(fileOrPath);
+        if(!res.ok) throw new Error(`Fetch ${res.status}: ${fileOrPath}`);
+        if(fileOrPath.endsWith('.gz')){
+          if(!('DecompressionStream' in window)) throw new Error('No gzip support');
+          const ds = new DecompressionStream('gzip');
+          const resp = new Response(res.body.pipeThrough(ds));
+          return await resp.text();
+        }
+        return await res.text();
+      }
+    }catch(err){
+      throw new Error(`Read failed: ${err.message || err}`);
+    }
+  }
+
+  /* --------- parse frames --------- */
+  function parseFrames(text){
+    const lines = text.trim().split(/\r?\n/);
+    const frames = [];
+    const ids = new Set();
+    for(const ln of lines){
+      try{
+        const j = JSON.parse(ln);
+        const ps = Array.isArray(j.particles) ? j.particles : [];
+        ps.forEach(p => { if(Number.isFinite(p.id)) ids.add(p.id); });
+        frames.push({tick: j.tick ?? 0, particles: ps, summary: j.summary || null});
+      }catch{ /* ignore */ }
+    }
+    const idList = Array.from(ids).sort((a,b)=>a-b);
+    const map = new Map(idList.map((id,i)=>[id,i]));
+    return {frames, pidToSlot: map, maxSlots: Math.max(1, idList.length)};
+  }
+
+  /* --------- three boilerplate --------- */
+  const renderer=new THREE.WebGLRenderer({canvas:document.getElementById("c"),antialias:true});
+  renderer.setSize(innerWidth,innerHeight);renderer.setPixelRatio(Math.min(devicePixelRatio,2));
+  const scene=new THREE.Scene();
+  const cam   =new THREE.PerspectiveCamera(60,innerWidth/innerHeight,1,1e6);
+  const ctl   =new OrbitControls(cam,renderer.domElement);ctl.enableDamping=true;
+  scene.add(new THREE.AmbientLight(0xffffff,0.9));
+  window.addEventListener('resize',()=>{renderer.setSize(innerWidth,innerHeight);
+      cam.aspect=innerWidth/innerHeight;cam.updateProjectionMatrix()});
+
+  /* --------- load static (guarded) --------- */
+  let st;
+  try{
+    const res = await fetch("results/static_universe.json");
+    if(!res.ok) throw new Error(`Fetch ${res.status}`);
+    st = await res.json();
+  }catch(err){
+    alert("Could not load results/static_universe.json.\n" +
+          "Serve from the project root (python -m http.server) and re-run export_data.py.\n" +
+          "Error: "+(err.message||err));
+    st = {nodes:{},edges:[]};
+  }
+
+  /* --------- substrate geometry (only if nodes exist) --------- */
+  const nArr=Object.values(st.nodes||{});
+  const pos=nArr.map(n=>new THREE.Vector3(...(n.position||[0,0,0]).slice(0,3)));
+  if(pos.length){
+    const box=new THREE.Box3().setFromPoints(pos);
+    const scale=120/box.getSize(new THREE.Vector3()).length();
+    pos.forEach(p=>p.multiplyScalar(scale));
+
+    const nGeo=new THREE.SphereGeometry(.9,8,8),
+          nMat=new THREE.MeshBasicMaterial({color:0x3b82f6,transparent:true,opacity:.24});
+    const nMesh=new THREE.InstancedMesh(nGeo,nMat,pos.length);
+    pos.forEach((v,i)=>nMesh.setMatrixAt(i,new THREE.Matrix4().setPosition(v)));
+    scene.add(nMesh);
+
+    const ePos=new Float32Array((st.edges||[]).length*6);
+    (st.edges||[]).forEach((e,i)=>{const a=pos[e[0]],b=pos[e[1]];
+        if(a&&b) ePos.set([a.x,a.y,a.z,b.x,b.y,b.z],i*6)});
+    const eGeo=new THREE.BufferGeometry().setAttribute('position',new THREE.BufferAttribute(ePos,3));
+    const eMat=new THREE.LineBasicMaterial({color:0x3b82f6,opacity:.10,transparent:true});
+    const eLines=new THREE.LineSegments(eGeo,eMat);scene.add(eLines);
+
+    showLines.onchange =()=>{nMesh.visible=eLines.visible=showLines.checked};
+
+    const c=box.getCenter(new THREE.Vector3());
+    cam.position.set(c.x,c.y,box.getSize(new THREE.Vector3()).length()*1.15);
+    ctl.target.copy(c);
+  }else{
+    cam.position.set(0,0,150); ctl.target.set(0,0,0);
+  }
+
+  /* --------- particle layer (allocated after init) --------- */
+  let pMesh, wLines, linePos, lineCol, tracks;
+  const BASE_R=1, TRACK=60;
+  const colCache=new Map();
+  function colour(period){
+    if(!colCache.has(period))
+      colCache.set(period,new THREE.Color().setHSL((period*0.618)%1,0.65,0.55));
+    return colCache.get(period);
+  }
+  const m4=new THREE.Matrix4();
+
+  /* --------- sparkline --------- */
+  const sparkBuf = [];
+  function pushSpark(births,deaths){
+    sparkBuf.push({b:births,d:deaths});
+    if(sparkBuf.length>120) sparkBuf.shift();
+    const w=spark.width=140, h=spark.height=28;
+    sctx.clearRect(0,0,w,h);
+    const maxv = Math.max(1, ...sparkBuf.map(x=>Math.max(x.b,x.d)));
+    sparkBuf.forEach((x,i)=>{
+      const xb = i/(sparkBuf.length-1||1)*w;
+      const yb = h - (x.b/maxv)*h, yd = h - (x.d/maxv)*h;
+      sctx.fillStyle = '#22c55e'; sctx.fillRect(xb, yb, 2, 2);
+      sctx.fillStyle = '#ef4444'; sctx.fillRect(xb, yd, 2, 2);
+    });
+  }
+
+  /* --------- playback --------- */
+  let frame=0, playing=true;
+  playBtn.onclick=()=>{playing=!playing;playBtn.textContent=playing?'❚❚':'▶︎'};
+
+  /* --------- per-frame draw (guarded) --------- */
+  function draw(k){
+    if(!FR || FR.length===0) return;
+    const f=FR[k]||{tick:0,particles:[],summary:null};
+    lbl.textContent='tick '+f.tick; seek.value=k;
+
+    const S=f.summary||{};
+    liveLbl.textContent = 'live '+(S.live_particles ?? f.particles.length ?? 0);
+    longLbl.textContent = 'longest '+(S.longest_lifetime_so_far ?? 0);
+    mdLbl.textContent   = 'mem '+(Number.isFinite(S.memory_density_mean)? S.memory_density_mean.toFixed(2) : '—');
+    curvLbl.textContent = 'κ '+(Number.isFinite(S.curvature_proxy)? S.curvature_proxy.toFixed(2) : '—');
+    chshLbl.textContent = 'S '+(Number.isFinite(S.chsh_S)? (+S.chsh_S).toFixed(3) : '—');
+
+    const prev = FR[Math.max(0,k-1)] || {particles:[]};
+    const prevIds = new Set(prev.particles.map(p=>p.id));
+    const nowIds  = new Set(f.particles.map(p=>p.id));
+    let births=0,deaths=0;
+    for(const id of nowIds) if(!prevIds.has(id)) births++;
+    for(const id of prevIds) if(!nowIds.has(id)) deaths++;
+    bornLbl.textContent = 'births '+births;
+    deadLbl.textContent = 'deaths '+deaths;
+    pushSpark(births,deaths);
+
+    // clear all instances by default
+    let seg=0;
+    for(let i=0;i<MAXP;i++){ m4.makeScale(0,0,0); pMesh.setMatrixAt(i,m4); tracks[i]=tracks[i]||[]; }
+
+    for(const P of f.particles){
+      const slot = pidToSlot.has(P.id) ? pidToSlot.get(P.id) : null;
+      if(slot===null || slot===undefined) continue;
+      const kin = P.kinematics||{};
+      const r   = kin.radius || 0;
+      const c4  = kin.centroid || [0,0,0,0];
+      if(!(r>0)) continue;
+      const v3=new THREE.Vector3(c4[0],c4[1],c4[2]);
+      m4.makeScale(r,r,r).setPosition(v3);
+      pMesh.setMatrixAt(slot,m4);
+      const cc=colour(P.period);
+      if(!pMesh.instanceColor) pMesh.instanceColor = new THREE.InstancedBufferAttribute(new Float32Array(MAXP*3),3);
+      pMesh.instanceColor.setXYZ(slot, cc.r, cc.g, cc.b);
+
+      const tr=tracks[slot]; tr.push(v3.clone()); if(tr.length>TRACK) tr.shift();
+      for(let j=1;j<tr.length;j++){
+        const a=tr[j-1], b=tr[j];
+        linePos.set([a.x,a.y,a.z,b.x,b.y,b.z], seg*6);
+        lineCol.set([cc.r,cc.g,cc.b, cc.r,cc.g,cc.b], seg*6);
+        seg++;
+      }
+    }
+    pMesh.instanceMatrix.needsUpdate=true; pMesh.instanceColor.needsUpdate=true;
+    wLines.geometry.setDrawRange(0, seg*2);
+    wLines.geometry.attributes.position.needsUpdate=true;
+    wLines.geometry.attributes.color.needsUpdate=true;
+  }
+
+  /* --------- initialise from text; only then attach seek.oninput ---------- */
+  function init(text){
+    const parsed = parseFrames(text);
+    FR = parsed.frames; pidToSlot = parsed.pidToSlot; MAXP = parsed.maxSlots || 1;
+
+    // allocate particle meshes now we know MAXP
+    if(pMesh) { scene.remove(pMesh); pMesh.dispose?.(); }
+    const pGeo=new THREE.IcosahedronGeometry(BASE_R,0);
+    const pMat=new THREE.MeshStandardMaterial({vertexColors:true,roughness:.35,metalness:.15});
+    pMesh=new THREE.InstancedMesh(pGeo,pMat,MAXP);
+    pMesh.instanceColor=new THREE.InstancedBufferAttribute(new Float32Array(MAXP*3),3);
+    scene.add(pMesh);
+
+    if(wLines) { scene.remove(wLines); wLines.geometry.dispose(); wLines.material.dispose(); }
+    linePos=new Float32Array(MAXP*TRACK*6);
+    lineCol=new Float32Array(MAXP*TRACK*6);
+    const lGeo=new THREE.BufferGeometry()
+                  .setAttribute('position',new THREE.BufferAttribute(linePos,3))
+                  .setAttribute('color',   new THREE.BufferAttribute(lineCol,3));
+    const lMat=new THREE.LineBasicMaterial({vertexColors:true,transparent:true,opacity:.65});
+    wLines=new THREE.LineSegments(lGeo,lMat);scene.add(wLines);
+
+    tracks=Array.from({length:MAXP},()=>[]);
+
+    seek.max = Math.max(FR.length-1,0);
+    seek.oninput = e => { frame = +e.target.value; draw(frame); };
+    frame=0; draw(0);
+  }
+
+  /* --------- auto-load log if present (with friendly errors) ---------- */
+  (async ()=>{
+    try{
+      let rawText="";
+      try { rawText = await readTextMaybeGz("results/simulation_log.jsonl.gz"); }
+      catch(_){ try { rawText = await readTextMaybeGz("results/simulation_log.jsonl"); } catch(__){} }
+      if(rawText && rawText.trim()) init(rawText);
+      else console.warn("No log found; drag-and-drop a .jsonl or .jsonl.gz");
+    }catch(err){
+      alert("Could not load log: "+(err.message||err));
+    }
+  })();
+
+  /* --------- animation loop ---------- */
+  let last=performance.now(),lastFPS=performance.now(),frames=0;
+  function loop(t){
+    requestAnimationFrame(loop); ctl.update();
+    if(playing && t-last>33 && FR && FR.length){frame=(frame+1)%FR.length; draw(frame); last=t;}
+    frames++; if(t-lastFPS>1000){fpsLbl.textContent=Math.round(frames*1000/(t-lastFPS))+' fps'; frames=0; lastFPS=t;}
+    renderer.render(scene,cam);
+  }
+  loop();
+  </script>
+</body>
+</html>
